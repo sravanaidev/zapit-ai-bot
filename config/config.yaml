@@ -1,0 +1,43 @@
+llm:
+  provider: "openai"          # openai | gemini
+  openai_model: "gpt-4o-mini"
+  gemini_model: "gemini-2.5-flash"
+  temperature: 0.3
+
+embedding:
+  provider: "openai"          # openai | gemini
+  openai_model: "text-embedding-3-small"
+  gemini_model: "models/gemini-embedding-2"
+
+vectordb:
+  faiss_path: "vectorstores/faiss_index"
+
+chunking:
+  chunk_size: 600
+  chunk_overlap: 100
+
+retrieval:
+  top_k_semantic: 10
+  top_k_bm25: 10
+  top_k_hybrid: 10
+
+bm25:
+  k1: 1.5
+  b: 0.75
+
+hybrid:
+  semantic_weight: 0.6
+  bm25_weight: 0.4
+
+reranking:
+  enabled: true
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  final_k: 4
+  max_chunk_chars: 1200
+
+memory:
+  window_size: 5
+
+ui:
+  title: "Zapit AI Assistant"
+  description: "Your intelligent guide to the Zapit file transfer application"
