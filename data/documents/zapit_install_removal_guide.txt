@@ -1,0 +1,378 @@
+════════════════════════════════════════════════════════
+  ZAPIT — REMOVE AND INSTALL REFERENCE GUIDE
+════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════
+  STEP 1 — REMOVE OLD VERSION
+════════════════════════════════════════════════════════
+
+── SERVER B (run first) ────────────────────────────────
+
+sudo systemctl stop zapit-recv
+sudo systemctl disable zapit-recv
+sudo rm -f /usr/local/bin/zapit-send
+sudo rm -f /usr/local/bin/zapit-recv
+sudo rm -f /etc/systemd/system/zapit-recv.service
+sudo systemctl daemon-reload
+rm -rf ~/zapit
+rm -f /var/lib/zapit/manifests/*.manifest.json
+rm -f /var/run/zapit/*.pid
+rm -f /data/received/.*.zapit-tmp
+
+── SERVER A ────────────────────────────────────────────
+
+sudo rm -f /usr/local/bin/zapit-send
+sudo rm -f /usr/local/bin/zapit-recv
+rm -rf ~/zapit
+rm -f /var/lib/zapit/manifests/*.manifest.json
+rm -f /var/run/zapit/*.pid
+
+── VERIFY CLEAN (both servers) ─────────────────────────
+
+which zapit-send
+which zapit-recv
+ls ~/zapit 2>/dev/null || echo "folder gone"
+
+
+════════════════════════════════════════════════════════
+  STEP 2 — UPLOAD ZIP (from laptop Git Bash)
+════════════════════════════════════════════════════════
+
+scp -i ~/.ssh/your-key.pem \
+  /c/Users/sia/Desktop/datatransfer/zapit.X.X.zip \
+  ec2-user@<SERVER-A-IP>:~/zapit.X.X.zip
+
+scp -i ~/.ssh/your-key.pem \
+  /c/Users/sia/Desktop/datatransfer/zapit.X.X.zip \
+  ec2-user@<SERVER-B-IP>:~/zapit.X.X.zip
+
+
+════════════════════════════════════════════════════════
+  STEP 3 — BUILD (both servers)
+════════════════════════════════════════════════════════
+
+cd ~
+unzip zapit.X.X.zip -d zapit
+cd zapit
+go mod tidy
+make build
+
+── Expected output ─────────────────────────────────────
+
+built ./bin/zapit-send
+built ./bin/zapit-recv
+
+
+════════════════════════════════════════════════════════
+  STEP 4 — INSTALL BINARIES (both servers)
+════════════════════════════════════════════════════════
+
+sudo cp bin/zapit-send /usr/local/bin/
+sudo cp bin/zapit-recv /usr/local/bin/
+sudo chmod +x /usr/local/bin/zapit-send
+sudo chmod +x /usr/local/bin/zapit-recv
+
+
+════════════════════════════════════════════════════════
+  STEP 5 — CREATE DIRECTORIES (both servers)
+════════════════════════════════════════════════════════
+
+sudo mkdir -p /var/lib/zapit/manifests
+sudo mkdir -p /var/log/zapit
+sudo mkdir -p /var/run/zapit
+sudo chown $(whoami):$(whoami) /var/lib/zapit
+sudo chown $(whoami):$(whoami) /var/lib/zapit/manifests
+sudo chown $(whoami):$(whoami) /var/log/zapit
+sudo chown $(whoami):$(whoami) /var/run/zapit
+
+
+════════════════════════════════════════════════════════
+  STEP 6 — INSTALL SERVICE (Server B only)
+════════════════════════════════════════════════════════
+
+sudo tee /etc/systemd/system/zapit-recv.service > /dev/null << 'EOF'
+[Unit]
+Description=Zapit receiver daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+ExecStart=/usr/local/bin/zapit-recv serve \
+  --listen          0.0.0.0:2222 \
+  --host-key        /etc/zapit/host_key \
+  --authorized-keys /etc/zapit/authorized_keys
+Restart=always
+RestartSec=3s
+TimeoutStartSec=30
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zapit-recv
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable zapit-recv
+sudo systemctl start zapit-recv
+
+
+════════════════════════════════════════════════════════
+  STEP 7 — VERIFY (Server B)
+════════════════════════════════════════════════════════
+
+sleep 10
+sudo systemctl status zapit-recv
+── Must show: active (running) ─────────────────────────
+
+
+════════════════════════════════════════════════════════
+  STEP 8 — VERIFY (Server A)
+════════════════════════════════════════════════════════
+
+zapit-send --help
+── Must show commands: send resume list status stop ─────
+
+
+════════════════════════════════════════════════════════
+  UDP BUFFER TUNING (both servers — run once)
+════════════════════════════════════════════════════════
+
+sudo sysctl -w net.core.rmem_max=268435456
+sudo sysctl -w net.core.rmem_default=268435456
+sudo sysctl -w net.core.wmem_max=268435456
+sudo sysctl -w net.core.wmem_default=268435456
+sudo sysctl -w net.core.netdev_max_backlog=50000
+
+sudo tee -a /etc/sysctl.conf << 'EOF'
+net.core.rmem_max=268435456
+net.core.rmem_default=268435456
+net.core.wmem_max=268435456
+net.core.wmem_default=268435456
+net.core.netdev_max_backlog=50000
+EOF
+
+sudo sysctl -p
+
+
+════════════════════════════════════════════════════════
+  TEST TRANSFER (Server A)
+════════════════════════════════════════════════════════
+
+zapit-send send \
+  --src             ~/testfile_10mb.bin \
+  --dest            /data/received/testfile_10mb.bin \
+  --host            172.31.6.117 \
+  --user            ec2-user \
+  --key             ~/.ssh/zapit_key \
+  --known-hosts     /etc/zapit/known_hosts \
+  --port            2222 \
+  --udp-port        9000 \
+  --chunk-mib       1 \
+  --encrypt \
+  --connect-timeout 10
+
+
+════════════════════════════════════════════════════════
+  USEFUL COMMANDS (Server A)
+════════════════════════════════════════════════════════
+
+zapit-send list
+zapit-send status --id <id>
+zapit-send stop   --id <id>
+zapit-send resume --id <id> --host 172.31.6.117 \
+  --user ec2-user --key ~/.ssh/zapit_key \
+  --known-hosts /etc/zapit/known_hosts \
+  --port 2222 --udp-port 9000 --encrypt
+
+tail -f /var/log/zapit/zapit-send-$(date +%Y-%m-%d).log
+grep "JOB" /var/log/zapit/zapit-send-$(date +%Y-%m-%d).log
+
+ps aux | grep zapit-send | grep -v grep
+ls -lh /var/run/zapit/
+
+
+════════════════════════════════════════════════════════
+  CANCEL A STUCK TRANSFER (Server A)
+════════════════════════════════════════════════════════
+
+ps aux | grep zapit-send | grep -v grep
+kill -9 <pid>
+rm -f /var/run/zapit/<transfer-id>.pid
+sed -i 's/"status": "in_progress"/"status": "cancelled"/' \
+  /var/lib/zapit/manifests/<transfer-id>.manifest.json
+rm -f /data/received/.*.zapit-tmp   (on Server B)
+
+
+════════════════════════════════════════════════════════
+
+dd if=/dev/urandom of=~/testfile_10mb.bin bs=1M count=2072 status=progress
+
+zapit-send nodes list
+
+zapit-send nodes test EC2_SERVER_B
+
+dd if=/dev/urandom of=~/testfile_800mb.bin bs=1M count=800 status=progress
+
+zapit-send send \
+  --src         ~/testfile_100mb.bin \
+  --dest        /data/received/testfile_100mb.bin \
+  --node        EC2_SERVER_B \
+  --remote-user ec2-user
+
+
+zapit-send send \
+  --src         ~/testfile_800mb.bin \
+  --dest        /data/received/testfile_800mb.bin \
+  --node        EC2_SERVER_B \
+  --remote-user ec2-user
+
+
+nodes:
+  EC2_SERVER_B:
+    host:            172.31.6.117
+    port:            2222
+    udp_port:        9000
+    encrypt:         true
+    key:             /home/ec2-user/.ssh/zapit_key
+    known_hosts:     /etc/zapit/known_hosts
+    connect_timeout: 10
+    chunk_mib:       1
+    max_retries:     5
+    window:          16
+    max_window:      512
+    rate_mbps:       0
+    description:     EC2 Test Server B
+
+
+
+zapit-send send \
+  --src             ~/testfile_2gb.bin \
+  --dest            /data/received/testfile_2gb.bin \
+  --host            172.31.6.117 \
+  --user            ec2-user \
+  --key             ~/.ssh/zapit_key \
+  --known-hosts     /etc/zapit/known_hosts \
+  --port            2222 \
+  --udp-port        9000 \
+  --chunk-mib       1 \
+  --encrypt \
+  --connect-timeout 10
+
+
+zapit-send send \
+  --src             ~/testfile_100mb.bin \
+  --dest            /data/received/testfile_100mb.bin \
+  --host            172.31.6.117 \
+  --user            ec2-user \
+  --key             ~/.ssh/zapit_key \
+  --known-hosts     /etc/zapit/known_hosts \
+  --port            2222 \
+  --udp-port        9000 \
+  --chunk-mib       1 \
+  --encrypt \
+  --connect-timeout 10
+
+
+
+
+zapit-send resume \
+  --id          78547ae0-9bd8-4460-829b-7a8c87406455 \
+  --host        172.31.6.117 \
+  --user        ec2-user \
+  --key         ~/.ssh/zapit_key \
+  --known-hosts /etc/zapit/known_hosts \
+  --port        2222 \
+  --udp-port    9000 \
+  --encrypt \
+  --connect-timeout 10
+
+
+zapit-send send \
+  --src             ~/testfile_500mb.bin \
+  --dest            /data/received/testfile_500mb.bin \
+  --host            172.31.6.117 \
+  --user            ec2-user \
+  --key             ~/.ssh/zapit_key \
+  --known-hosts     /etc/zapit/known_hosts \
+  --port            2222 \
+  --udp-port        9000 \
+  --chunk-mib       1 \
+  --encrypt \
+  --connect-timeout 10
+
+zapit-send list
+
+zapit-send status --id <transfer-id>
+
+zapit-send cancel --id <transfer-id>
+
+
+watch -n 3 zapit-send list
+
+
+tail -f /var/log/zapit/zapit-send-$(date +%Y-%m-%d).log
+
+
+ps aux | grep zapit-send | grep -v grep
+
+
+
+
+
+
+
+zapit submit \
+  --src         /home/ec2-user/testfile_600mb.bin \
+  --dest        /data/received/testfile_600mb.bin \
+  --node        EC2_SERVER_B \
+  --remote-user ec2-user
+
+zapit submit \
+  --src         /home/ec2-user/testfile_600mb.bin \
+  --dest        /data/soy/testfile_600mb.bin \
+  --node        EC2_SERVER_B \
+  --remote-user ec2-user
+
+
+to server A
+
+
+zapit submit \
+  --src         /data/received/testfile_600mb.bin \
+  --dest        /home/ec2-user/data/serverA/testfile_600mb.bin \
+  --node        EC2_SERVER_B \
+  --remote-user ec2-user
+
+
+# /etc/zapit/nodes.conf
+# Zapit node configuration — v4.0
+# One node per destination server.
+# The remote user is specified per job with --remote-user flag.
+# The destination path is specified per job with --dest flag.
+#
+# Usage:
+#   zapit-send send --src /data/file.csv --dest /vendor/incoming/file.csv \
+#     --node BARCLAYS_PROD --remote-user svc_zapit
+#
+# Copy this file to /etc/zapit/nodes.conf and edit for your environment.
+
+nodes:
+  EC2_SERVER_B:
+    host:            172.31.4.43
+    port:            2222
+    udp_port:        9000
+    encrypt:         true
+    key:             /home/ec2-user/.ssh/zapit_key
+    known_hosts:     /etc/zapit/known_hosts
+    connect_timeout: 10
+    chunk_mib:       1
+    max_retries:     5
+    window:          16
+    max_window:      512
+    rate_mbps:       0
+    description:     EC2 Test Server A

@@ -1,0 +1,413 @@
+================================================================================
+ZAPIT COMMAND REFERENCE — ALL COMMANDS FROM DEVELOPMENT SESSION
+================================================================================
+
+================================================================================
+1. SERVER SETUP (Fresh EC2 Instance)
+================================================================================
+
+# Install prerequisites
+sudo yum install -y git make rpm-build
+
+# Install Go
+wget https://go.dev/dl/go1.22.4.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.22.4.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+go version
+
+# Install garble (obfuscation)
+go install mvdan.cc/garble@v0.12.1
+export PATH=$PATH:$(go env GOPATH)/bin
+
+# Clone repo
+cd ~
+git clone https://github.com/saisharan5111/zapit.3.0.git zapit-4.4
+cd zapit-4.4
+
+# Build
+go mod tidy
+make build
+
+================================================================================
+2. SERVER A (SENDER) SETUP
+================================================================================
+
+# Create directories
+sudo mkdir -p /etc/zapit
+sudo mkdir -p /var/lib/zapit/manifests
+sudo mkdir -p /var/log/zapit
+sudo mkdir -p /var/run/zapit
+sudo chown -R ec2-user:ec2-user /var/lib/zapit /var/log/zapit /var/run/zapit
+
+# Generate SSH keys
+ssh-keygen -t ed25519 -f ~/.ssh/zapit_key -N "" -C "zapit-transfer-key"
+ssh-keygen -t ed25519 -f /etc/zapit/host_key -N "" -C "zapit-host-key"
+sudo chown ec2-user:ec2-user /etc/zapit/host_key
+cp ~/.ssh/zapit_key.pub /etc/zapit/authorized_keys
+
+# Create nodes.conf (replace SERVER_B_IP)
+cat > /etc/zapit/nodes.conf << 'EOF'
+[EC2_SERVER_B]
+host        = SERVER_B_IP
+port        = 2222
+user        = ec2-user
+key         = /home/ec2-user/.ssh/zapit_key
+known_hosts = /etc/zapit/known_hosts
+insecure    = true
+encrypt     = true
+init_window = 64
+max_window  = 512
+EOF
+
+# UDP buffer tuning
+sudo tee /etc/sysctl.d/99-zapit.conf << 'EOF'
+net.core.rmem_max=268435456
+net.core.wmem_max=268435456
+net.core.rmem_default=26214400
+net.core.wmem_default=26214400
+net.core.netdev_max_backlog=50000
+EOF
+sudo sysctl -p /etc/sysctl.d/99-zapit.conf
+
+# Install binaries
+sudo cp bin/zapitd       /usr/local/bin/
+sudo cp bin/zapit        /usr/local/bin/
+sudo cp bin/zapit-send   /usr/local/bin/
+sudo cp bin/zapit-reader /usr/local/bin/
+
+# Set zapit-reader setuid
+sudo groupadd zapit 2>/dev/null || true
+sudo usermod -aG zapit ec2-user
+sudo chown root:zapit /usr/local/bin/zapit-reader
+sudo chmod 4750 /usr/local/bin/zapit-reader
+
+# Create systemd service
+sudo tee /etc/systemd/system/zapitd.service << 'EOF'
+[Unit]
+Description=Zapit daemon
+After=network.target
+[Service]
+Type=simple
+User=ec2-user
+ExecStart=/usr/local/bin/zapitd serve \
+  --listen 0.0.0.0:2222 \
+  --host-key /etc/zapit/host_key \
+  --authorized-keys /etc/zapit/authorized_keys \
+  --nodes-conf /etc/zapit/nodes.conf \
+  --log-dir /var/log/zapit \
+  --manifest-dir /var/lib/zapit/manifests \
+  --max-concurrent 4
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable zapitd
+sudo systemctl start zapitd
+
+# Record Server B host key
+ssh-keyscan -p 2222 SERVER_B_IP >> /etc/zapit/known_hosts 2>/dev/null
+
+# Create test files
+dd if=/dev/urandom of=/home/ec2-user/testfile_15gb.bin bs=1M count=15360 status=progress
+
+================================================================================
+3. SERVER B (RECEIVER) SETUP
+================================================================================
+
+# Create directories
+sudo mkdir -p /etc/zapit
+sudo mkdir -p /var/lib/zapit/manifests
+sudo mkdir -p /var/log/zapit
+sudo mkdir -p /var/run/zapit
+sudo mkdir -p /data/received
+sudo chown -R ec2-user:ec2-user /var/lib/zapit /var/log/zapit /var/run/zapit /data/received
+
+# Generate host key
+ssh-keygen -t ed25519 -f /etc/zapit/host_key -N "" -C "zapit-host-key"
+sudo chown ec2-user:ec2-user /etc/zapit/host_key
+
+# Copy authorized_keys from Server A
+scp ec2-user@SERVER_A_IP:~/.ssh/zapit_key.pub /tmp/zapit_key.pub
+cp /tmp/zapit_key.pub /etc/zapit/authorized_keys
+
+# Install binaries
+sudo cp bin/zapitd     /usr/local/bin/
+sudo cp bin/zapit      /usr/local/bin/
+sudo cp bin/zapit-recv /usr/local/bin/
+
+# UDP buffer tuning (same as Server A)
+sudo tee /etc/sysctl.d/99-zapit.conf << 'EOF'
+net.core.rmem_max=268435456
+net.core.wmem_max=268435456
+net.core.rmem_default=26214400
+net.core.wmem_default=26214400
+net.core.netdev_max_backlog=50000
+EOF
+sudo sysctl -p /etc/sysctl.d/99-zapit.conf
+
+# Create systemd service (same but no nodes.conf)
+sudo tee /etc/systemd/system/zapitd.service << 'EOF'
+[Unit]
+Description=Zapit daemon
+After=network.target
+[Service]
+Type=simple
+User=ec2-user
+ExecStart=/usr/local/bin/zapitd serve \
+  --listen 0.0.0.0:2222 \
+  --host-key /etc/zapit/host_key \
+  --authorized-keys /etc/zapit/authorized_keys \
+  --log-dir /var/log/zapit \
+  --manifest-dir /var/lib/zapit/manifests \
+  --max-concurrent 4
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable zapitd
+sudo systemctl start zapitd
+
+================================================================================
+4. TRANSFER COMMANDS
+================================================================================
+
+# Basic transfer (AIMD default)
+zapit submit \
+  --src /home/ec2-user/testfile_15gb.bin \
+  --dest /data/received/file.bin \
+  --node EC2_SERVER_B \
+  --remote-user ec2-user
+
+# SPRINT+ (no target)
+zapit submit \
+  --src /home/ec2-user/testfile_15gb.bin \
+  --dest /data/received/test_sprint.bin \
+  --node EC2_SERVER_B --remote-user ec2-user \
+  --congestion sprint
+
+# SPRINT+ Dedicated (500 MB/s target)
+zapit submit \
+  --src /home/ec2-user/testfile_15gb.bin \
+  --dest /data/received/test_dedicated.bin \
+  --node EC2_SERVER_B --remote-user ec2-user \
+  --congestion sprint --target-rate 500m
+
+# With SHA-256 verification
+zapit submit \
+  --src /home/ec2-user/testfile_15gb.bin \
+  --dest /data/received/test_verified.bin \
+  --node EC2_SERVER_B --remote-user ec2-user \
+  --congestion sprint --target-rate 500m --verify
+
+# With rate limit
+zapit submit \
+  --src /data/file.bin \
+  --dest /data/received/file.bin \
+  --node SERVER_B --remote-user ec2-user \
+  --rate-limit 100m
+
+# With source user
+zapit submit \
+  --src /app/data/export.csv \
+  --dest /data/incoming/export.csv \
+  --node SERVER_B --remote-user ec2-user \
+  --source-user app_user
+
+# 1 Gbps target
+zapit submit \
+  --src /data/large.bin --dest /data/received/large.bin \
+  --node SERVER_B --remote-user ec2-user \
+  --congestion sprint --target-rate 1g
+
+================================================================================
+5. JOB MANAGEMENT
+================================================================================
+
+zapit list
+zapit status --id ZAPIT-20260605-00003
+zapit cancel --id ZAPIT-20260605-00003
+zapit stop --id ZAPIT-20260605-00003
+zapit hold --id ZAPIT-20260605-00003
+zapit release --id ZAPIT-20260605-00003
+zapit restart --id ZAPIT-20260605-00003
+zapit restart --all-failed
+zapit purge
+zapit drain
+zapit nodes list
+watch -n 1 zapit list
+
+================================================================================
+6. LOG ANALYSIS
+================================================================================
+
+# View today's log
+tail -f /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log
+
+# Find transfer results
+grep "avg_rate\|COMPLETE\|FAILED" /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log
+
+# Find errors
+grep "level=ERROR" /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log
+
+# Find specific job
+grep "ZAPIT-20260605-00003" /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log
+
+# Check verification results
+grep "CHECKSUM\|verification\|SHA-256\|AES-256" /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log | tail -10
+
+# Check commit (file rename)
+grep "commit\|Commit\|committed" /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log | tail -5
+
+# Comprehensive log grep
+grep "avg_rate\|congestion controller\|SPRINT\|FAILED\|CHECKSUM\|verification\|inline\|committed" \
+  /var/log/zapit/zapit-zapitd-$(date +%Y-%m-%d).log | tail -20
+
+================================================================================
+7. SERVICE MANAGEMENT
+================================================================================
+
+sudo systemctl start zapitd
+sudo systemctl stop zapitd
+sudo systemctl restart zapitd
+sudo systemctl status zapitd
+sudo systemctl enable zapitd
+sudo systemctl disable zapitd
+journalctl -u zapitd -f
+journalctl -u zapitd --no-pager -n 50
+
+================================================================================
+8. BUILD & DEPLOY (from zip)
+================================================================================
+
+# Extract and build
+rm -rf ~/zapit-4.4
+cd ~
+unzip zapit.4.4.zip -d zapit-4.4
+cd zapit-4.4
+go mod tidy
+make build
+
+# Install on Server A
+sudo cp bin/zapitd       /usr/local/bin/
+sudo cp bin/zapit        /usr/local/bin/
+sudo cp bin/zapit-reader /usr/local/bin/
+sudo systemctl restart zapitd
+
+# Install on Server B
+sudo cp bin/zapitd     /usr/local/bin/
+sudo cp bin/zapit-recv /usr/local/bin/
+sudo systemctl restart zapitd
+
+# Clean received files before re-testing
+rm -f /data/received/*
+
+================================================================================
+9. RPM PACKAGING
+================================================================================
+
+# Install build tools
+sudo yum install -y rpm-build
+go install mvdan.cc/garble@v0.12.1
+export PATH=$PATH:$(go env GOPATH)/bin
+
+# Build RPM
+cd ~/zapit-4.4
+go mod tidy
+make rpm
+
+# Add -literals for string encryption
+sed -i 's/garble build/garble -literals build/g' Makefile
+make clean
+make rpm
+
+# Verify obfuscation
+strings bin/zapitd | grep -i "SPRINT+\|Scalable Pacing"
+strings bin/zapitd | grep -ic "sprint\|congestion\|manifest\|chunker\|fileHasher"
+
+# Check RPM contents
+rpm -qlp dist/zapit-4.4-1.amzn2023.x86_64.rpm
+
+# Install RPM
+sudo rpm -i zapit-4.4-1.amzn2023.x86_64.rpm
+
+# Upgrade RPM
+sudo rpm -U zapit-4.4-1.amzn2023.x86_64.rpm
+
+# Remove RPM
+sudo rpm -e zapit
+
+# Check installed version
+rpm -q zapit
+
+# Copy RPM to another server
+scp dist/zapit-4.4-1.amzn2023.x86_64.rpm ec2-user@SERVER_B:~/
+
+================================================================================
+10. CUSTOM INSTALL PATH
+================================================================================
+
+# Change data path
+echo "ZAPIT_HOME=/data/zapit" | sudo tee /etc/sysconfig/zapit
+sudo systemctl restart zapitd
+
+# Verify
+cat /etc/sysconfig/zapit
+ls /data/zapit/log/
+
+================================================================================
+11. TROUBLESHOOTING
+================================================================================
+
+# Check if port is open
+ss -tlnp | grep 2222
+nc -zv SERVER_B_IP 2222
+
+# Check instance type
+curl -s http://169.254.169.254/latest/meta-data/instance-type
+
+# Check availability zone
+curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone
+
+# Check UDP buffers
+sysctl net.core.rmem_max
+sudo sysctl -p /etc/sysctl.d/99-zapit.conf
+
+# Check disk speed
+dd if=/dev/zero of=/tmp/test bs=1M count=1024 oflag=dsync
+
+# Check zapit-reader setuid
+ls -la /usr/local/bin/zapit-reader
+sudo chown root:root /usr/local/bin/zapit-reader
+sudo chmod 4755 /usr/local/bin/zapit-reader
+
+# Manual rename if .zapit-tmp stuck
+mv /data/received/.filename.zapit-tmp /data/received/filename
+
+# Manual checksum verify
+sha256sum /home/ec2-user/testfile_15gb.bin
+sha256sum /data/received/test_fast.bin
+
+# Check processes
+ps aux | grep zapitd
+
+================================================================================
+12. AWS SECURITY GROUP RULES
+================================================================================
+
+# Required inbound rules on BOTH servers:
+#   TCP 2222  — zapit SSH control channel
+#   UDP 9000  — zapit data transfer
+#   TCP 22    — your SSH access
+
+================================================================================
+END OF COMMAND REFERENCE
+================================================================================
